@@ -1,0 +1,425 @@
+ensure_package <- function(pkg){
+  pkg <- as.character(substitute(pkg))
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+  if(!require(pkg, character.only=TRUE)) install.packages(pkg)
+  stopifnot(require(pkg, character.only=TRUE))
+}
+ensure_package(dplyr)
+ensure_package(stringr)
+ensure_package(tidyr)
+ensure_package(httr2)
+ensure_package(rvest)
+ensure_package(datasets)
+ensure_package(purrr)
+ensure_package(DT)
+
+get_eia_sep <- function(state, abbr){
+  state_formatted <- str_to_lower(state) |> str_replace_all("\\s", "")
+  
+  dir_name <- file.path("data", "mp02")
+  file_name <- file.path(dir_name, state_formatted)
+  
+  dir.create(dir_name, showWarnings=FALSE, recursive=TRUE)
+  
+  if(!file.exists(file_name)){
+    BASE_URL <- "https://www.eia.gov"
+    REQUEST <- request(BASE_URL) |> 
+      req_url_path("electricity", "state", state_formatted)
+    
+    RESPONSE <- req_perform(REQUEST)
+    
+    resp_check_status(RESPONSE)
+    
+    writeLines(resp_body_string(RESPONSE), file_name)
+  }
+  
+  TABLE <- read_html(file_name) |> 
+    html_element("table") |> 
+    html_table() |>
+    mutate(Item = str_to_lower(Item))
+  
+  if("U.S. rank" %in% colnames(TABLE)){
+    TABLE <- TABLE |> rename(Rank = `U.S. rank`)
+  }
+  
+  CO2_MWh <- TABLE |> 
+    filter(Item == "carbon dioxide (lbs/mwh)") |>
+    pull(Value) |> 
+    str_replace_all(",", "") |>
+    as.numeric()
+  
+  PRIMARY <- TABLE |> 
+    filter(Item == "primary energy source") |> 
+    pull(Rank)
+  
+  RATE <- TABLE |>
+    filter(Item == "average retail price (cents/kwh)") |>
+    pull(Value) |>
+    as.numeric()
+  
+  GENERATION_MWh <- TABLE |>
+    filter(Item == "net generation (megawatthours)") |>
+    pull(Value) |>
+    str_replace_all(",", "") |>
+    as.numeric()
+  
+  data.frame(CO2_MWh               = CO2_MWh, 
+             primary_source        = PRIMARY,
+             electricity_price_MWh = RATE * 10, # / 100 cents to dollars &
+             # * 1000 kWh to MWH 
+             generation_MWh        = GENERATION_MWh, 
+             state                 = state, 
+             abbreviation          = abbr
+  )
+}
+
+EIA_SEP_REPORT <- map2(state.name, state.abb, get_eia_sep) |> list_rbind()
+
+ensure_package(scales)
+ensure_package(DT)
+
+EIA_SEP_REPORT |> 
+  select(-abbreviation) |>
+  arrange(desc(CO2_MWh)) |>
+  mutate(CO2_MWh = number(CO2_MWh, big.mark=","), 
+         electricity_price_MWh = dollar(electricity_price_MWh), 
+         generation_MWh = number(generation_MWh, big.mark=",")) |>
+  rename(`Pounds of CO2 Emitted per MWh of Electricity Produced`=CO2_MWh, 
+         `Primary Source of Electricity Generation`=primary_source, 
+         `Average Retail Price for 1000 kWh`=electricity_price_MWh, 
+         `Total Generation Capacity (MWh)`= generation_MWh, 
+         State=state) |>
+  datatable()
+
+
+
+#1. Which state has the most expensive retail electricity?
+#To find the state with the most expensive retail electricity, we sort by the electricity price and get the first row.
+EIA_SEP_REPORT %>%
+  arrange(desc(electricity_price_MWh)) %>%
+  select(state, electricity_price_MWh) %>%
+  slice(1)
+
+#2. Which state has the 'dirtiest' electricity mix?
+#This will be the state with the highest CO2 emissions per MWh.
+EIA_SEP_REPORT %>%
+  arrange(desc(CO2_MWh)) %>%
+  select(state, CO2_MWh) %>%
+  slice(1)
+
+#3. On average, how many pounds of CO2 are emitted per MWh of electricity produced in the US?
+#Here, a weighted average needs to be calculated, using total generation as the weight.
+weighted.mean(EIA_SEP_REPORT$CO2_MWh, EIA_SEP_REPORT$generation_MWh, na.rm = TRUE)
+
+
+#4. What is the rarest primary energy source in the US? What is the associated cost of electricity and where is it used?
+#To determine the rarest primary energy source, we will count occurrences of each source and then find associated costs and locations.
+
+
+rarest_source <- EIA_SEP_REPORT %>%
+  count(primary_source, sort = TRUE) %>%
+  slice(1) %>%
+  pull(primary_source)
+
+EIA_SEP_REPORT %>%
+  filter(primary_source == rarest_source) %>%
+  select(state, primary_source, electricity_price_MWh)
+
+#How many times cleaner is NY’s energy mix than that of Texas?
+#This involves comparing CO2 emissions per MWh between New York (NY) and Texas (TX).
+ny_co2 <- EIA_SEP_REPORT %>%
+  filter(state == "New York") %>%
+  pull(CO2_MWh)
+
+tx_co2 <- EIA_SEP_REPORT %>%
+  filter(state == "Texas") %>%
+  pull(CO2_MWh)
+
+cleanliness_ratio <- ny_co2 / tx_co2
+cleanliness_ratio
+
+
+
+#2023 Annual Database Energy Consumption
+ensure_package(readxl)
+
+# Create 'data/mp02' directory if not already present
+DATA_DIR <- file.path("data", "mp02")
+dir.create(DATA_DIR, showWarnings=FALSE, recursive=TRUE)
+
+NTD_ENERGY_FILE <- file.path(DATA_DIR, "2023_ntd_energy.xlsx")
+
+if(!file.exists(NTD_ENERGY_FILE)){
+  DS <- download.file("https://www.transit.dot.gov/sites/fta.dot.gov/files/2024-10/2023%20Energy%20Consumption.xlsx", 
+                      destfile=NTD_ENERGY_FILE, 
+                      method="curl")
+  
+  if(DS | (file.info(NTD_ENERGY_FILE)$size == 0)){
+    cat("I was unable to download the NTD Energy File. Please try again.\n")
+    stop("Download failed")
+  }
+}
+
+NTD_ENERGY_RAW <- read_xlsx(NTD_ENERGY_FILE)
+
+#basic cleanup
+ensure_package(tidyr)
+to_numeric_fill_0 <- function(x){
+  x <- if_else(x == "-", NA, x)
+  replace_na(as.numeric(x), 0)
+}
+
+NTD_ENERGY <- NTD_ENERGY_RAW |> 
+  select(-c(`Reporter Type`, 
+            `Reporting Module`, 
+            `Other Fuel`, 
+            `Other Fuel Description`)) |>
+  mutate(across(-c(`Agency Name`, 
+                   `Mode`,
+                   `TOS`), 
+                to_numeric_fill_0)) |>
+  group_by(`NTD ID`, `Mode`, `Agency Name`) |>
+  summarize(across(where(is.numeric), sum), 
+            .groups = "keep") |>
+  mutate(ENERGY = sum(c_across(c(where(is.numeric))))) |>
+  filter(ENERGY > 0) |>
+  select(-ENERGY) |>
+  ungroup()
+
+# Display 10 random rows
+slice_sample(NTD_ENERGY , n=10)
+
+ #distict values of Mode
+distinct_Mode <- distinct(NTD_ENERGY,Mode)
+print(distinct_Mode)
+
+#Recoding the Mode COlumn
+NTD_ENERGY <- NTD_ENERGY |> mutate(Mode = case_when(Mode == "DR" ~ "Demand Response", 
+                                                    Mode =="FB" ~ "Ferryboar", 
+                                                    Mode =="MB" ~ "Motorbus", 
+                                                    Mode =="SR" ~ "Streetcar Rail", 
+                                                    Mode =="TB" ~ "Trolleybus",
+                                                    Mode =="VP" ~ "Vanpool",
+                                                    Mode =="CB" ~ "Commuter Bus",
+                                                    Mode =="RB" ~ "Rural Bus",
+                                                    Mode =="LR" ~ "Light Rail", 
+                                                    Mode =="MG" ~ "Monorail/Guideway",
+                                                    Mode =="CR" ~ "Commuter Rail",
+                                                    Mode =="AR" ~ "Alaska Railroad",
+                                                    Mode =="TR" ~ "Tourist Railroad",
+                                                    Mode =="HR" ~ "Heavy Rail",
+                                                    Mode =="YR" ~ "Yard",
+                                                    Mode =="IP" ~ "Inclined Plane",
+                                                    Mode =="PB" ~ "Publico",
+                                                    Mode =="CC" ~ "Cable Car",
+                                                    TRUE ~ Mode))
+distinct(NTD_ENERGY, Mode)
+
+
+# Ensure necessary packages are loaded
+if (!require("readr")) install.packages("readr", repos = "http://cran.us.r-project.org")
+library(readr)
+
+# Define the data directory and file path
+data_dir <- "data"
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+ntd_service_file <- file.path(data_dir, "2023_service.csv")
+
+# Download the file if it doesn't exist
+if (!file.exists(ntd_service_file)) {
+  download.file("https://data.transportation.gov/resource/6y83-7vuw.csv", destfile = ntd_service_file, method = "curl")
+}
+
+# Read the data
+NTD_SERVICE <- read_csv(ntd_service_file)
+
+
+# Data cleaning and transformation
+NTD_SERVICE <- NTD_SERVICE %>%
+  mutate(
+    NTD_ID = as.numeric(`_5_digit_ntd_id`),
+    Agency = as.character(agency),
+    City = as.character(max_city),
+    State = as.character(max_state),
+    UPT = as.numeric(sum_unlinked_passenger_trips_upt),
+    MILES = as.numeric(sum_passenger_miles)
+  ) %>%
+  select(NTD_ID, Agency, City, State, UPT, MILES) %>%
+  filter(MILES > 0)
+
+
+# Identify transit service with the most UPT annually
+max_upt_service <- NTD_SERVICE %>% 
+  arrange(desc(UPT)) %>% 
+  slice(1)
+print(max_upt_service)
+
+# Average trip length for MTA NYC
+avg_trip_length_mta_nyc <- NTD_SERVICE %>% 
+  filter(grepl("MTA", Agency) & (City == "New York City" | City == "Brooklyn")) %>% 
+  summarize(AverageTripLength = mean(MILES / UPT, na.rm = TRUE))
+print(avg_trip_length_mta_nyc)
+
+# Transit service in NYC with the longest average trip length
+longest_trip_service_nyc <- NTD_SERVICE %>% 
+  filter(City == "New York City" | City == "Brooklyn") %>% 
+  mutate(AverageTripLength = MILES / UPT) %>%
+  arrange(desc(AverageTripLength)) %>% 
+  slice(1)
+print(longest_trip_service_nyc)
+
+
+# State with the fewest miles
+fewest_miles_state <- NTD_SERVICE %>% 
+  group_by(State) %>% 
+  summarize(TotalMiles = sum(MILES, na.rm = TRUE)) %>% 
+  arrange(TotalMiles) %>% 
+  slice(1)
+print(fewest_miles_state)
+
+# Check for missing states
+all_states <- state.name
+represented_states <- unique(NTD_SERVICE$State)
+missing_states <- setdiff(all_states, represented_states)
+print(all_states)
+
+#ANALYSIS
+library(dplyr)
+colnames(NTD_ENERGY)
+colnames(NTD_SERVICE)
+colnames(EIA_SEP_REPORT)
+
+Combined_Table1 <- left_join(NTD_ENERGY,NTD_SERVICE, by = "Agency")
+Combined_Table2 <- full_join(Combined_Table1,EIA_SEP_REPORT, by = "State")
+rm(Combined_Table2)
+EIA_SEP_REPORT <- EIA_SEP_REPORT %>% rename (state = State)
+EIA_SEP_REPORT <- EIA_SEP_REPORT %>% rename (State = abbreviation)
+
+Combined_Table2 <- full_join(Combined_Table1,EIA_SEP_REPORT, by = "State")
+
+
+# Selecting and arranging columns
+Final_Table <- Combined_Table2 %>%
+  select(Agency, Mode, State, everything())
+
+
+# Calculate Total Emissions
+
+emission_factors <- list(
+  Diesel = 22.45,
+  Gasoline = 20.86,
+  NaturalGas = 120.85,
+  Electricity = 1.22,
+  Kerosene = 21.78,
+  petroleum = 33.04
+)
+
+Final_Table <- Final_Table %>%
+ mutate(TotalEmissions =  `Diesel Fuel`*22.45+
+          Gasoline*20.86+
+          `Bio-Diesel`*22.45 +
+          `C Natural Gas`*120.85+
+          `Electric Battery`*1.22+
+          `Electric Propulsion`*1.22+
+          Ethanol*33.04+
+          Methonal*33.04+
+          `Liquified Nat Gas`*120.85+
+          `Liquified Petroleum Gas`*33.04+
+          Kerosene*21.78)
+  
+#Compute Emissions per UPT & Emissions per MIles
+Final_Table <-  Final_Table %>% 
+  mutate( EmissionsPerUPT = TotalEmissions/ Final_Table$UPT,
+          EmissionsPerMiles = TotalEmissions/Final_Table$MILES)
+
+
+# Define size categories based on UPT or another metric
+Final_Table <- Final_Table %>%
+  mutate(SizeCategory = case_when(
+    EmissionsPerUPT < quantile(EmissionsPerUPT,0.33) ~ "Small",
+    EmissionsPerUPT < quantile(EmissionsPerUPT, 0.67)~ "Medium",
+    TRUE ~ "Large"))
+  
+
+  
+# Filter out extremely small agencies if needed
+Final_Table <- Final_Table %>%
+  filter(EmissionsPerUPT >60)
+
+# Find the most efficient agencies in each size category
+MostEfficientAgencies <- Final_Table %>%
+  group_by(SizeCategory) %>%
+  summarize(MostEfficientPerUPT = Agency[which.min(EmissionsPerUPT)],
+            MostEfficientPerMiles = Agency[which.min(EmissionsPerMiles)])
+  
+print(MostEfficientAgencies)
+
+# Identify the Greenest Transit Agency by lowest emissions per passenger mile
+greenest_agency <- Final_Table %>%
+  filter(EmissionsPerMiles == min(EmissionsPerMiles, na.rm = TRUE))
+print(greenest_agency)
+
+
+#MostEmissions Avoided Award
+# Assuming car emissions of 411 grams CO2 per mile (EPA estimate for average passenger vehicle)
+car_emission_factor <- 411 / 1000  # Convert to kg for consistency
+
+# Compute car emissions
+Final_Table <- Final_Table %>%
+  mutate(CarEmissions = MILES * car_emission_factor)
+
+# Calculate emissions avoided
+Final_Table <- Final_Table %>%
+  mutate(EmissionsAvoided = CarEmissions - TotalEmissions)
+
+# Most Emissions Avoided
+most_emissions_avoided <- Final_Table %>%
+  filter(EmissionsAvoided == max(EmissionsAvoided, na.rm = TRUE))
+print(most_emissions_avoided)
+
+
+#Lowest Emission Intensity
+
+Final_Table <- Final_Table %>%
+  mutate(TotalEnergyUsed = `Diesel Fuel`+`Bio-Diesel`+`Bunker Fuel`+ `C Natural Gas`+ Gasoline +`Electric Battery`+`Electric Propulsion`+
+          Methonal +Ethanol+Hydrogen+Kerosene+`Liquified Nat Gas`+`Liquified Petroleum Gas`)
+Final_Table <- Final_Table %>% 
+  mutate(EmissionsIntensity = TotalEmissions/ TotalEnergyUsed)
+
+lowest_emissions_intensity_agency <- Final_Table %>%
+  filter(EmissionsIntensity == min(EmissionsIntensity, na.rm = TRUE))
+print(lowest_emissions_intensity_agency)
+
+
+#Worst Of" Award: Highest Emissions per Passenger Mile
+# Agency with the highest emissions per passenger mile
+worst_emissions_per_mile <- Final_Table %>%
+  filter(EmissionsPerMiles == max(EmissionsPerMiles, na.rm = TRUE))
+print(worst_emissions_per_mile)
+
+
+
+
+summary(Final_Table$EmissionsPerUPT)
+summary(Final_Table$EmissionsIntensity)
+summary(Final_Table$EmissionsPerMiles)
+
+
+#Visualizations
+library(ggplot2)
+ggplot(Final_Table, aes(x = Agency,
+                        y = EmissionsIntensity, fill = State)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  labs(title = "Emission Intensity by Agency",
+       x = "Agency",
+       y = "Emissions Intensity (per unit energy used)")
+
+
+ggplot(Final_Table, aes(x = MILES, y = EmissionsPerMiles, color = Mode)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title = "Emissions Per Mile by Mode of Transport",
+       x = "Miles Traveled",
+       y = "Emissions Per Mile",
+       color = "Mode")
