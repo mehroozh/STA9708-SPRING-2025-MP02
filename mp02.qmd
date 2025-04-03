@@ -22,7 +22,7 @@
     </style>
 </head>
 <body>
-    <iframe src="folder_name/mehroozh_STA9708-SPRING-2025-MP02.pdf"></iframe>
-<p><a href="folder_name/mehroozh_STA9708-SPRING-2025-MP02.pdf">Click here to view the PDF</a></p>
+    <iframe src="folder_name/mehroozh_STA9750-SPRING-2025-MP02.pdf"></iframe>
+<p><a href="folder_name/mehroozh_STA9750-SPRING-2025-MP02.pdf">Click here to view the PDF</a></p>
 </body>
 </html>
